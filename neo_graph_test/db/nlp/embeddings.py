@@ -17,7 +17,7 @@ _INIT_LOCK = threading.Lock()
 
 
 def _get_device() -> str:
-    """Return device string. Respects EMBEDDINGS_DEVICE or auto-detects CUDA."""
+    """Return device string. Respects EMBEDDINGS_DEVICE or auto-detects CUDA/MPS."""
     global _DEVICE
     if _DEVICE is not None:
         return _DEVICE
@@ -25,7 +25,13 @@ def _get_device() -> str:
     if env_device:
         _DEVICE = env_device
         return _DEVICE
-    _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    # Приоритет: CUDA > MPS > CPU
+    if torch.cuda.is_available():
+        _DEVICE = "cuda"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        _DEVICE = "mps"
+    else:
+        _DEVICE = "cpu"
     return _DEVICE
 
 

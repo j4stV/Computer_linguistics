@@ -13,11 +13,20 @@ class LLMGenerator:
         
         Args:
             model_name: Имя модели из HuggingFace
-            device: Устройство для вычислений ('cuda', 'cpu' или None для автоопределения)
-            use_8bit: Использовать ли 8-bit квантование для экономии памяти (быстрее для маленьких моделей)
+            device: Устройство для вычислений ('cuda', 'mps', 'cpu' или None для автоопределения)
+            use_8bit: Использовать ли 8-bit квантование для экономии памяти (только для CUDA)
         """
         self.model_name = model_name
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Автоопределение устройства: CUDA > MPS > CPU
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = device
         self.use_8bit = use_8bit
         self.tokenizer: Optional[AutoTokenizer] = None
         self.model: Optional[AutoModelForCausalLM] = None
@@ -62,6 +71,10 @@ class LLMGenerator:
             if self.device == "cuda" and not self.use_8bit:
                 load_kwargs["torch_dtype"] = torch.float16
                 load_kwargs["device_map"] = "auto"
+            elif self.device == "mps":
+                # MPS требует float32 (float16 не полностью поддерживается)
+                load_kwargs["torch_dtype"] = torch.float32
+                # Не используем device_map для MPS, переместим вручную
             else:
                 load_kwargs["torch_dtype"] = torch.float32
             
@@ -70,7 +83,7 @@ class LLMGenerator:
                 **load_kwargs
             )
             
-            # Определяем фактическое устройство модели
+            # Определяем фактическое устройство модели и перемещаем на нужное устройство
             if self.use_8bit and self.device == "cuda":
                 # При 8-bit квантовании модель автоматически на CUDA
                 # Определяем конкретное устройство (может быть cuda:0, cuda:1 и т.д.)
@@ -86,6 +99,10 @@ class LLMGenerator:
                         self.model_device = "cuda"
                 else:
                     self.model_device = "cuda"
+            elif self.device == "mps":
+                # Перемещаем модель на MPS вручную
+                self.model = self.model.to(self.device)
+                self.model_device = "mps"
             elif self.device == "cpu" and not self.use_8bit:
                 self.model = self.model.to(self.device)
                 self.model_device = "cpu"
@@ -205,7 +222,29 @@ class LLMGenerator:
         """
         # Формируем промпт
         context = "\n\n".join(context_texts)
-        prompt = f"""Дай ответ на данный вопрос, используя информацию из текста:
+        
+        # Определяем, нужно ли искать информацию о персоне
+        question_lower = question.lower()
+        is_person_question = any(word in question_lower for word in ['кто', 'кем', 'кого', 'кому', 'кем запущен', 'кто запустил', 'кто создал', 'кем создан'])
+        
+        # Улучшенный промпт с явным указанием на поиск информации о персоне
+        if is_person_question:
+            prompt = f"""Дай точный ответ на вопрос, используя информацию из текста. 
+ВАЖНО: Если вопрос касается того, кто или кем что-то сделал (запустил, создал и т.д.), 
+обязательно найди информацию о персоне (PER-XXX) в тексте и укажи её название и имя, если они есть.
+
+Вопрос: {question}
+
+Текст:
+{context}
+
+Инструкции:
+- Если в тексте есть информация о персоне (PER-XXX), которая связана с вопросом, обязательно укажи её название (например, PER-001) и имя (если указано в тексте).
+- Если в тексте есть узел типа "Персона" или "Object" с названием PER-XXX, который связан с экспериментом или тестом из вопроса, используй эту информацию.
+- В тексте могут быть указаны имя и фамилия персоны в виде отдельных атрибутов (например, "Алексей", "Петров"). Если они есть, обязательно включи их в ответ в формате "PER-XXX Имя Фамилия".
+- Будь точным и конкретным в ответе. Формат ответа: "PER-XXX Имя Фамилия" (например, "PER-001 Алексей Петров")."""
+        else:
+            prompt = f"""Дай ответ на данный вопрос, используя информацию из текста:
 {question}
 
 Текст:

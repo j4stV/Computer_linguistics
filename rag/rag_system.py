@@ -8,6 +8,7 @@ from .text_transformer import TextTransformer
 from .embedding_manager import EmbeddingManager
 from .retriever import Retriever
 from .llm_generator import LLMGenerator
+from .llm_generator_api import LLMGeneratorAPI
 from neo_graph_test.db.nlp.embeddings import get_embeddings
 
 
@@ -20,16 +21,22 @@ class RAGSystem:
         llm_model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
         cache_dir: Optional[str] = None,
         n_nodes: int = 10,
-        m_nodes: int = 5
+        m_nodes: int = 5,
+        use_api: bool = False,
+        api_provider: str = "mistral",
+        api_key: Optional[str] = None
     ):
         """Инициализация RAG системы.
         
         Args:
             ontology_files: Список путей к JSON файлам с онтологиями
-            llm_model_name: Имя модели LLM из HuggingFace
+            llm_model_name: Имя модели LLM из HuggingFace (если use_api=False) или имя модели API
             cache_dir: Директория для кэширования эмбеддингов
             n_nodes: Количество узлов для первого поиска
             m_nodes: Количество узлов для второго поиска
+            use_api: Использовать ли API вместо локальной модели
+            api_provider: Провайдер API ('mistral', 'openai', 'anthropic')
+            api_key: API ключ (если None, берется из переменных окружения)
         """
         print("Инициализация RAG системы...")
         
@@ -38,9 +45,19 @@ class RAGSystem:
         self.transformer = None  # Будет инициализирован после загрузки онтологий
         self.embedding_manager = EmbeddingManager(cache_dir=cache_dir)
         self.retriever = Retriever(self.embedding_manager)
-        # Определяем, использовать ли 8-bit для маленьких моделей
-        use_8bit = "tiny" in llm_model_name.lower() or "phi" in llm_model_name.lower() or "gpt2" in llm_model_name.lower()
-        self.llm_generator = LLMGenerator(model_name=llm_model_name, use_8bit=use_8bit)
+        
+        # Инициализация генератора (локальный или API)
+        if use_api:
+            print(f"Использование API провайдера: {api_provider}")
+            self.llm_generator = LLMGeneratorAPI(
+                provider=api_provider,
+                api_key=api_key,
+                model=llm_model_name if llm_model_name != "meta-llama/Llama-3.1-8B-Instruct" else None
+            )
+        else:
+            # Определяем, использовать ли 8-bit для маленьких моделей
+            use_8bit = "tiny" in llm_model_name.lower() or "phi" in llm_model_name.lower() or "gpt2" in llm_model_name.lower()
+            self.llm_generator = LLMGenerator(model_name=llm_model_name, use_8bit=use_8bit)
         
         # Параметры поиска
         self.n_nodes = n_nodes
@@ -80,12 +97,13 @@ class RAGSystem:
         # Сохраняем в кэш
         self.embedding_manager.save_cache()
     
-    def _get_connected_node_indices(self, node_indices: List[int], max_depth: int = 1) -> List[int]:
+    def _get_connected_node_indices(self, node_indices: List[int], max_depth: int = 1, verbose: bool = False) -> List[int]:
         """Находит индексы узлов, связанных с данными узлами через граф.
         
         Args:
             node_indices: Список индексов узлов
             max_depth: Максимальная глубина поиска связей (1 = только прямые связи)
+            verbose: Выводить ли детальное логирование
             
         Returns:
             Список индексов связанных узлов
@@ -95,15 +113,34 @@ class RAGSystem:
         # Создаем обратный маппинг: индекс -> ID узла
         index_to_id = {idx: node_id for node_id, idx in self.embedding_manager.node_indices.items()}
         
+        if verbose:
+            print(f"  🔍 Поиск связей для {len(node_indices)} узлов...")
+        
         for node_idx in node_indices:
             node_id = index_to_id.get(node_idx)
             if not node_id:
+                if verbose:
+                    print(f"  ⚠️  Узел с индексом {node_idx} не найден в маппинге")
                 continue
+            
+            if verbose:
+                # Получаем текст узла для логирования
+                node_text = self.retriever.get_node_texts([node_idx])[0] if self.retriever.get_node_texts([node_idx]) else "N/A"
+                print(f"  📌 Проверка узла {node_idx}:")
+                print(f"     ID: {node_id[:80]}...")
+                print(f"     Текст: {node_text[:100]}...")
             
             # Получаем все связи для этого узла
             edges = self.loader.get_edges_for_node(node_id)
             
-            for edge in edges:
+            if verbose:
+                print(f"     Найдено связей: {len(edges)}")
+            
+            if len(edges) == 0:
+                if verbose:
+                    print(f"     ⚠️  Связи не найдены для узла {node_id[:50]}...")
+            
+            for edge_idx, edge in enumerate(edges):
                 # Определяем связанный узел
                 source = edge.get('source')
                 target = edge.get('target')
@@ -118,18 +155,49 @@ class RAGSystem:
                 else:
                     target_id = str(target) if target else ''
                 
+                if verbose:
+                    edge_data = edge.get('data', {})
+                    edge_label = edge_data.get('uri', edge_data.get('labels', ['N/A'])[0] if edge_data.get('labels') else 'N/A')
+                    print(f"     Связь {edge_idx + 1}:")
+                    print(f"       Тип: {edge_label}")
+                    print(f"       Source ID: {source_id[:60]}...")
+                    print(f"       Target ID: {target_id[:60]}...")
+                
                 # Определяем ID связанного узла
                 if source_id == node_id:
                     related_node_id = target_id
+                    direction = "outgoing"
                 elif target_id == node_id:
                     related_node_id = source_id
+                    direction = "incoming"
                 else:
+                    if verbose:
+                        print(f"       ⚠️  Узел не участвует в связи (source={source_id[:30]}, target={target_id[:30]})")
                     continue
+                
+                if verbose:
+                    print(f"       Направление: {direction}")
+                    print(f"       Связанный узел ID: {related_node_id[:60]}...")
                 
                 # Получаем индекс связанного узла
                 related_idx = self.embedding_manager.node_indices.get(related_node_id)
                 if related_idx is not None:
                     connected_indices.add(related_idx)
+                    if verbose:
+                        related_text = self.retriever.get_node_texts([related_idx])[0] if self.retriever.get_node_texts([related_idx]) else "N/A"
+                        print(f"       ✅ Найден связанный узел {related_idx}: {related_text[:80]}...")
+                else:
+                    if verbose:
+                        print(f"       ⚠️  Связанный узел {related_node_id[:50]}... не найден в индексах эмбеддингов")
+                        # Проверяем, есть ли такой узел вообще
+                        related_node = self.loader.get_node_by_id(related_node_id)
+                        if related_node:
+                            print(f"       ℹ️  Узел существует в онтологии, но отсутствует в эмбеддингах")
+                        else:
+                            print(f"       ❌ Узел не найден в онтологии")
+        
+        if verbose:
+            print(f"  📊 Итого найдено {len(connected_indices)} уникальных связанных узлов")
         
         return list(connected_indices)
     
@@ -169,9 +237,12 @@ class RAGSystem:
         
         if verbose:
             print(f"Найдено {len(n_results)} узлов:")
-            for idx, (node_idx, score, text) in enumerate(n_results[:3], 1):
+            for idx, (node_idx, score, text) in enumerate(n_results, 1):
+                # Получаем ID узла для логирования
+                node_id = {idx: node_id for node_id, idx in self.embedding_manager.node_indices.items()}.get(node_idx, "N/A")
                 print(f"  {idx}. Узел {node_idx} (сходство: {score:.4f})")
-                print(f"     {text[:100]}...")
+                print(f"     ID: {str(node_id)[:80]}...")
+                print(f"     Текст: {text[:100]}...")
         
         # Получаем индексы N узлов
         n_node_indices = [idx for idx, _, _ in n_results]
@@ -179,7 +250,14 @@ class RAGSystem:
         # Фаза 2.5: Поиск связанных узлов через граф
         if verbose:
             print(f"\nФаза 2.5: Поиск связанных узлов через графовые связи...")
-        connected_indices = self._get_connected_node_indices(n_node_indices, max_depth=1)
+            print(f"Проверяем {len(n_node_indices)} найденных узлов:")
+            for idx, node_idx in enumerate(n_node_indices[:5], 1):
+                node_id = {idx: node_id for node_id, idx in self.embedding_manager.node_indices.items()}.get(node_idx)
+                node_text = self.retriever.get_node_texts([node_idx])[0] if self.retriever.get_node_texts([node_idx]) else "N/A"
+                print(f"  {idx}. Узел {node_idx}: {node_text[:80]}...")
+                if node_id:
+                    print(f"     ID: {node_id[:80]}...")
+        connected_indices = self._get_connected_node_indices(n_node_indices, max_depth=1, verbose=verbose)
         
         # Исключаем уже найденные узлы
         new_connected_indices = [idx for idx in connected_indices if idx not in n_node_indices]

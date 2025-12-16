@@ -79,10 +79,21 @@ class OntologyLoader:
         """
         result = []
         for edge in self.edges:
-            source = edge.get('source', {}).get('id') if isinstance(edge.get('source'), dict) else edge.get('source')
-            target = edge.get('target', {}).get('id') if isinstance(edge.get('target'), dict) else edge.get('target')
+            source = edge.get('source')
+            target = edge.get('target')
             
-            if source == node_id or target == node_id:
+            # Извлекаем ID из source и target (могут быть строками или объектами)
+            if isinstance(source, dict):
+                source_id = source.get('id', '')
+            else:
+                source_id = str(source) if source else ''
+            
+            if isinstance(target, dict):
+                target_id = target.get('id', '')
+            else:
+                target_id = str(target) if target else ''
+            
+            if source_id == node_id or target_id == node_id:
                 result.append(edge)
         return result
     
